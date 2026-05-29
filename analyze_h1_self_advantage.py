@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 r"""
-Section 4.3.2: H1 analysis for Self-style subjective advantages.
+Section 4.3.2: H1 analysis — individualized consistent style vs style mismatch.
+
+Operationalization (longitudinal following tasks):
+  - Aligned / individualized-consistent: Self vehicle OR preset matching Following Label
+  - Mismatch: the two non-own presets (mean)
+  - Extreme mismatch: Aggressive <-> Conservative opposite; Neutral uses mean(Aggressive, Conservative)
 
 Run:
   C:\Users\16638\miniconda3\envs\carla\python.exe analyze_h1_self_advantage.py
@@ -25,27 +30,40 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "356953624_按序号_自动驾驶系统乘坐体验问卷_241_240.xlsx"
+STYLE_FILE = BASE_DIR / "style.txt"
 OUTPUT_DIR = BASE_DIR / "analysis_output_h1_self_advantage"
 
 SUBJECT_COL_INDEX = 9
 GROUP_COL_INDEX = 10
 
 STYLE_ORDER = ["aggressive", "consecutive", "neutral", "self"]
+PRESET_STYLES = ["aggressive", "consecutive", "neutral"]
 STYLE_LABELS = {
     "aggressive": "Aggressive",
     "consecutive": "Conservative",
     "neutral": "Neutral",
     "self": "Self",
 }
+LABEL_TO_STYLE_KEY = {
+    "Aggressive": "aggressive",
+    "Conservative": "consecutive",
+    "Neutral": "neutral",
+}
 STYLE_COLORS = {
     "aggressive": "#d62728",
     "consecutive": "#2ca02c",
     "neutral": "#1f77b4",
     "self": "#ff7f0e",
+    "aligned": "#9467bd",
+    "mismatch": "#8c564b",
+    "extreme": "#bcbd22",
 }
-CONDITIONS = [
+H1_CONDITIONS = [
     ("l3", "L3 Following"),
     ("l4 follow", "L4 Following"),
+]
+ALL_CONDITIONS = [
+    *H1_CONDITIONS,
     ("l4 overtake", "L4 Overtaking"),
 ]
 
@@ -59,11 +77,12 @@ class Metric:
     y_max: float
     ticks: list[float]
     integer_only: bool = False
+    higher_is_better: bool = True
 
 
 METRICS = [
     Metric("comfort", "Comfort", 11, 0, 100, [0, 20, 40, 60, 80, 100]),
-    Metric("comfort_rank", "Comfort rank", 11, 1, 4, [1, 2, 3, 4]),
+    Metric("comfort_rank", "Comfort rank", 11, 1, 4, [1, 2, 3, 4], higher_is_better=False),
     Metric("expectation", "Expectation", 14, 1, 5, [1, 2, 3, 4, 5], True),
     Metric("trust", "Trust", 15, 1, 5, [1, 2, 3, 4, 5], True),
 ]
@@ -107,6 +126,14 @@ def p_stars(p_value: float) -> str:
     return ""
 
 
+def score_for_comparison(value: float, metric: Metric) -> float:
+    if pd.isna(value):
+        return np.nan
+    if metric.higher_is_better:
+        return float(value)
+    return -float(value)
+
+
 def paired_tests(a: pd.Series, b: pd.Series) -> dict:
     pair = pd.concat([a, b], axis=1, keys=["a", "b"]).dropna()
     diff = pair["a"] - pair["b"]
@@ -135,10 +162,21 @@ def paired_tests(a: pd.Series, b: pd.Series) -> dict:
     }
 
 
+def load_style_labels() -> pd.DataFrame:
+    if not STYLE_FILE.exists():
+        raise FileNotFoundError(f"style.txt not found: {STYLE_FILE}")
+
+    labels = pd.read_csv(STYLE_FILE, sep="\t")
+    labels = labels.rename(columns={"Driver": "subject"}).copy()
+    labels["subject"] = labels["subject"].astype(str).str.strip()
+    labels["Following Label"] = labels["Following Label"].astype(str).str.strip()
+    return labels[["subject", "Following Label"]]
+
+
 def load_detail(df: pd.DataFrame) -> pd.DataFrame:
     detail = pd.DataFrame(
         {
-            "subject": df.iloc[:, SUBJECT_COL_INDEX],
+            "subject": df.iloc[:, SUBJECT_COL_INDEX].astype(str).str.strip(),
             "group": df.iloc[:, GROUP_COL_INDEX],
         }
     )
@@ -159,14 +197,140 @@ def load_detail(df: pd.DataFrame) -> pd.DataFrame:
     return detail
 
 
+def attach_following_labels(detail: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    merged = detail.merge(labels, on="subject", how="inner")
+    merged["own_style_key"] = merged["Following Label"].map(LABEL_TO_STYLE_KEY)
+    return merged.dropna(subset=["own_style_key"]).copy()
+
+
 def metric_wide(detail: pd.DataFrame, metric_key: str) -> pd.DataFrame:
     return detail.pivot_table(index="subject", columns=["condition", "style"], values=metric_key, aggfunc="mean")
+
+
+def mismatch_preset_styles(own_style_key: str) -> list[str]:
+    return [style for style in PRESET_STYLES if style != own_style_key]
+
+
+def extreme_mismatch_styles(own_style_key: str) -> list[str]:
+    if own_style_key == "aggressive":
+        return ["consecutive"]
+    if own_style_key == "consecutive":
+        return ["aggressive"]
+    return ["aggressive", "consecutive"]
+
+
+def cell_value(wide: pd.DataFrame, subject: str, condition_key: str, style_key: str, metric: Metric) -> float:
+    col = (condition_key, style_key)
+    if col not in wide.columns or subject not in wide.index:
+        return np.nan
+    return score_for_comparison(wide.loc[subject, col], metric)
+
+
+def mean_values(values: list[float]) -> float:
+    clean = [v for v in values if pd.notna(v)]
+    if not clean:
+        return np.nan
+    return float(np.mean(clean))
+
+
+def build_subject_contrasts(detail: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    labeled = attach_following_labels(detail, labels)
+    subjects = sorted(labeled["subject"].unique())
+    label_map = labels.set_index("subject")["Following Label"].to_dict()
+    own_map = {subject: LABEL_TO_STYLE_KEY[label_map[subject]] for subject in subjects if subject in label_map}
+
+    rows = []
+    for metric in METRICS:
+        wide = metric_wide(labeled, metric.key)
+        for condition_key, condition_label in H1_CONDITIONS:
+            for subject in subjects:
+                if subject not in wide.index:
+                    continue
+                own_key = own_map.get(subject)
+                if not own_key:
+                    continue
+                self_score = cell_value(wide, subject, condition_key, "self", metric)
+                own_score = cell_value(wide, subject, condition_key, own_key, metric)
+                mismatch_styles = mismatch_preset_styles(own_key)
+                mismatch_scores = [
+                    cell_value(wide, subject, condition_key, style_key, metric) for style_key in mismatch_styles
+                ]
+                extreme_styles = extreme_mismatch_styles(own_key)
+                extreme_scores = [
+                    cell_value(wide, subject, condition_key, style_key, metric) for style_key in extreme_styles
+                ]
+
+                aligned_scores = [v for v in [self_score, own_score] if pd.notna(v)]
+                rows.append(
+                    {
+                        "subject": subject,
+                        "following_label": label_map.get(subject),
+                        "own_style_key": own_key,
+                        "metric": metric.label,
+                        "metric_key": metric.key,
+                        "condition": condition_label,
+                        "condition_key": condition_key,
+                        "self_score": self_score,
+                        "own_label_score": own_score,
+                        "aligned_best": max(aligned_scores) if aligned_scores else np.nan,
+                        "aligned_mean": mean_values(aligned_scores),
+                        "mismatch_mean": mean_values(mismatch_scores),
+                        "extreme_mismatch": mean_values(extreme_scores),
+                        "mismatch_styles": "/".join(STYLE_LABELS[s] for s in mismatch_styles),
+                        "extreme_styles": "/".join(STYLE_LABELS[s] for s in extreme_styles),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def contrast_tests(
+    contrasts: pd.DataFrame,
+    label_filter: str | None = None,
+) -> pd.DataFrame:
+    rows = []
+    data = contrasts if label_filter is None else contrasts[contrasts["following_label"] == label_filter]
+
+    comparisons = [
+        ("aligned_best", "mismatch_mean", "Aligned best (Self/own) - Mismatch mean"),
+        ("aligned_mean", "mismatch_mean", "Aligned mean (Self+own)/2 - Mismatch mean"),
+        ("self_score", "mismatch_mean", "Self - Mismatch mean"),
+        ("own_label_score", "mismatch_mean", "Own-label preset - Mismatch mean"),
+        ("self_score", "own_label_score", "Self - Own-label preset"),
+        ("aligned_best", "extreme_mismatch", "Aligned best - Extreme mismatch"),
+        ("self_score", "extreme_mismatch", "Self - Extreme mismatch"),
+    ]
+
+    for metric in METRICS:
+        sub_metric = data[data["metric_key"] == metric.key]
+        for condition_key, condition_label in H1_CONDITIONS:
+            sub = sub_metric[sub_metric["condition_key"] == condition_key]
+            if sub.empty:
+                continue
+            for left_col, right_col, comparison in comparisons:
+                test = paired_tests(sub[left_col], sub[right_col])
+                rows.append(
+                    {
+                        "analysis_scope": label_filter or "All subjects",
+                        "following_label": label_filter or "All",
+                        "metric": metric.label,
+                        "metric_key": metric.key,
+                        "condition": condition_label,
+                        "condition_key": condition_key,
+                        "comparison": comparison,
+                        "left_column": left_col,
+                        "right_column": right_col,
+                        "left_mean": round(float(sub[left_col].mean()), 4),
+                        "right_mean": round(float(sub[right_col].mean()), 4),
+                        **test,
+                    }
+                )
+    return pd.DataFrame(rows)
 
 
 def descriptives(detail: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for metric in METRICS:
-        for condition_key, condition_label in CONDITIONS:
+        for condition_key, condition_label in ALL_CONDITIONS:
             for style in STYLE_ORDER:
                 values = detail.loc[
                     (detail["condition"] == condition_key) & (detail["style"] == style),
@@ -195,7 +359,7 @@ def self_vs_others(detail: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for metric in METRICS:
         wide = metric_wide(detail, metric.key)
-        for condition_key, condition_label in CONDITIONS:
+        for condition_key, condition_label in ALL_CONDITIONS:
             self_col = (condition_key, "self")
             if self_col not in wide.columns:
                 continue
@@ -205,7 +369,9 @@ def self_vs_others(detail: pd.DataFrame) -> pd.DataFrame:
                 other_col = (condition_key, style)
                 if other_col not in wide.columns:
                     continue
-                test = paired_tests(wide[self_col], wide[other_col])
+                left = wide[self_col].map(lambda v: score_for_comparison(v, metric))
+                right = wide[other_col].map(lambda v: score_for_comparison(v, metric))
+                test = paired_tests(left, right)
                 rows.append(
                     {
                         "metric": metric.label,
@@ -222,41 +388,18 @@ def self_vs_others(detail: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def self_gap_vs_best_other(desc: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for metric in METRICS:
-        metric_desc = desc[desc["metric_key"] == metric.key]
-        for condition_key, condition_label in CONDITIONS:
-            sub = metric_desc[metric_desc["condition"] == condition_label]
-            self_mean = float(sub.loc[sub["style"] == "Self", "mean"].iloc[0])
-            others = sub[sub["style"] != "Self"].copy()
-            best = others.loc[others["mean"].idxmax()]
-            rows.append(
-                {
-                    "metric": metric.label,
-                    "metric_key": metric.key,
-                    "condition": condition_label,
-                    "self_mean": round(self_mean, 3),
-                    "best_other_style": best["style"],
-                    "best_other_mean": round(float(best["mean"]), 3),
-                    "self_minus_best_other": round(self_mean - float(best["mean"]), 3),
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def plot_expectation_means(detail: pd.DataFrame, out_path: Path) -> bool:
+def plot_following_expectation_by_style(detail: pd.DataFrame, out_path: Path) -> bool:
     if not HAS_MPL:
         return False
     setup_font()
 
     metric = next(m for m in METRICS if m.key == "expectation")
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.6), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.6), sharey=True)
     fig.patch.set_facecolor("white")
-    fig.suptitle("Expectation Consistency by Style", fontsize=14, fontweight="bold", y=1.03)
+    fig.suptitle("H1 Following Tasks: Expectation by Vehicle Style", fontsize=14, fontweight="bold", y=1.03)
 
     x = np.arange(len(STYLE_ORDER))
-    for ax, (condition_key, condition_label) in zip(axes, CONDITIONS):
+    for ax, (condition_key, condition_label) in zip(axes, H1_CONDITIONS):
         means, ses = [], []
         for style in STYLE_ORDER:
             values = detail.loc[
@@ -286,14 +429,34 @@ def plot_expectation_means(detail: pd.DataFrame, out_path: Path) -> bool:
     return True
 
 
-def plot_self_vs_others_heatmap(tests: pd.DataFrame, out_path: Path) -> bool:
+def plot_aligned_vs_mismatch_heatmap(tests: pd.DataFrame, out_path: Path, metric_key: str, title: str) -> bool:
     if not HAS_MPL:
         return False
     setup_font()
 
-    sub = tests[tests["metric_key"] == "expectation"].copy()
-    row_labels = [label for _, label in CONDITIONS]
-    col_labels = ["Self - Aggressive", "Self - Conservative", "Self - Neutral"]
+    sub = tests[
+        (tests["analysis_scope"] == "All subjects")
+        & (tests["metric_key"] == metric_key)
+        & tests["comparison"].isin(
+            [
+                "Aligned best (Self/own) - Mismatch mean",
+                "Self - Mismatch mean",
+                "Own-label preset - Mismatch mean",
+                "Aligned best - Extreme mismatch",
+            ]
+        )
+    ].copy()
+    if sub.empty:
+        return False
+
+    row_labels = [label for _, label in H1_CONDITIONS]
+    col_labels = [
+        "Aligned best - Mismatch mean",
+        "Self - Mismatch mean",
+        "Own-label preset - Mismatch mean",
+        "Aligned best - Extreme mismatch",
+    ]
+    short_cols = ["Aligned - Mismatch", "Self - Mismatch", "Own label - Mismatch", "Aligned - Extreme"]
     values = np.full((len(row_labels), len(col_labels)), np.nan)
     annotations = [["" for _ in col_labels] for _ in row_labels]
     for i, condition in enumerate(row_labels):
@@ -309,27 +472,27 @@ def plot_self_vs_others_heatmap(tests: pd.DataFrame, out_path: Path) -> bool:
     if not np.isfinite(max_abs) or max_abs == 0:
         max_abs = 1.0
 
-    fig, ax = plt.subplots(figsize=(7.8, 3.8))
+    fig, ax = plt.subplots(figsize=(9.0, 3.8))
     fig.patch.set_facecolor("white")
-    im = ax.imshow(values, cmap="RdYlGn_r", vmin=-max_abs, vmax=max_abs, aspect="auto")
-    ax.set_xticks(np.arange(len(col_labels)))
-    ax.set_xticklabels(col_labels, rotation=15, ha="right")
+    im = ax.imshow(values, cmap="RdYlGn", vmin=-max_abs, vmax=max_abs, aspect="auto")
+    ax.set_xticks(np.arange(len(short_cols)))
+    ax.set_xticklabels(short_cols, rotation=15, ha="right")
     ax.set_yticks(np.arange(len(row_labels)))
     ax.set_yticklabels(row_labels)
-    ax.set_title("Self Advantage in Expectation Consistency", fontsize=13, fontweight="bold", pad=12)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
     for i in range(values.shape[0]):
         for j in range(values.shape[1]):
             ax.text(j, i, annotations[i][j], ha="center", va="center", fontsize=10, color="#222222")
     cbar = fig.colorbar(im, ax=ax, shrink=0.82)
-    cbar.set_label("Self minus comparison style", fontsize=9)
+    cbar.set_label("paired mean difference (higher = left condition better)", fontsize=9)
     ax.text(
         0,
-        -0.28,
-        "Cell values are paired mean differences. + p<.10, * p<.05, ** p<.01, *** p<.001.",
+        -0.30,
+        "Aligned = max(Self, own-label preset). Mismatch = mean of two non-own presets. + p<.10, * p<.05, ** p<.01.",
         transform=ax.transAxes,
         ha="left",
         va="top",
-        fontsize=9,
+        fontsize=8.5,
         color="#333333",
     )
     for spine in ax.spines.values():
@@ -341,85 +504,116 @@ def plot_self_vs_others_heatmap(tests: pd.DataFrame, out_path: Path) -> bool:
     return True
 
 
-def plot_self_gap_heatmap(gap: pd.DataFrame, out_path: Path) -> bool:
+def plot_by_label_expectation(contrasts: pd.DataFrame, out_path: Path) -> bool:
     if not HAS_MPL:
         return False
     setup_font()
 
-    metric_order = ["Expectation", "Trust", "Comfort", "Comfort rank"]
-    condition_labels = [label for _, label in CONDITIONS]
-    values = gap.pivot(index="metric", columns="condition", values="self_minus_best_other").reindex(metric_order)[condition_labels]
-    max_abs = np.nanmax(np.abs(values.to_numpy(dtype=float)))
-    if not np.isfinite(max_abs) or max_abs == 0:
-        max_abs = 1.0
+    sub = contrasts[contrasts["metric_key"] == "expectation"].copy()
+    if sub.empty:
+        return False
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.2))
+    label_groups = ["Aggressive", "Conservative", "Neutral"]
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), sharey=True)
     fig.patch.set_facecolor("white")
-    im = ax.imshow(values.to_numpy(dtype=float), cmap="RdYlGn_r", vmin=-max_abs, vmax=max_abs, aspect="auto")
-    ax.set_xticks(np.arange(len(condition_labels)))
-    ax.set_xticklabels(condition_labels, rotation=15, ha="right")
-    ax.set_yticks(np.arange(len(metric_order)))
-    ax.set_yticklabels(metric_order)
-    ax.set_title("Self Gap Against Best Non-Self Style", fontsize=13, fontweight="bold", pad=12)
-    for i in range(values.shape[0]):
-        for j in range(values.shape[1]):
-            value = values.iloc[i, j]
-            ax.text(j, i, f"{value:+.2f}", ha="center", va="center", fontsize=10, color="#222222")
-    cbar = fig.colorbar(im, ax=ax, shrink=0.82)
-    cbar.set_label("Self mean - best non-Self mean", fontsize=9)
-    ax.text(
-        0,
-        -0.28,
-        "Positive values indicate Self is the highest-scoring style; negative values indicate another style is higher.",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-        color="#333333",
-    )
-    for spine in ax.spines.values():
-        spine.set_color("#333333")
-        spine.set_linewidth(0.8)
+    fig.suptitle("H1 Expectation: Aligned vs Mismatch by Following Label Group", fontsize=13, fontweight="bold", y=1.03)
+
+    categories = ["Self", "Own label", "Mismatch mean", "Extreme mismatch"]
+    x = np.arange(len(categories))
+    width = 0.22
+    palette = ["#ff7f0e", "#9467bd", "#8c564b", "#bcbd22"]
+
+    for ax, (condition_key, condition_label) in zip(axes, H1_CONDITIONS):
+        for idx, label in enumerate(label_groups):
+            part = sub[(sub["condition_key"] == condition_key) & (sub["following_label"] == label)]
+            if part.empty:
+                continue
+            means = [
+                float(part["self_score"].mean()),
+                float(part["own_label_score"].mean()),
+                float(part["mismatch_mean"].mean()),
+                float(part["extreme_mismatch"].mean()),
+            ]
+            offset = (idx - 1) * width
+            ax.bar(x + offset, means, width=width, label=f"{label} (n={part['subject'].nunique()})", color=palette, alpha=0.55 + 0.15 * idx, edgecolor="#333333", linewidth=0.6)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(categories, rotation=12, ha="right")
+        ax.set_ylim(0.6, 5.2)
+        ax.set_yticks([1, 2, 3, 4, 5])
+        ax.set_title(condition_label, fontsize=11, fontweight="bold")
+        ax.axhline(3, color="#666666", linestyle="--", linewidth=0.9, alpha=0.75)
+        ax.grid(True, axis="y", linestyle="--", color="#cccccc", alpha=0.85)
+        for spine in ax.spines.values():
+            spine.set_color("#333333")
+            spine.set_linewidth(0.8)
+
+    axes[0].set_ylabel("average score")
+    axes[1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=9, frameon=False)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return True
 
 
-def write_summary(desc: pd.DataFrame, tests: pd.DataFrame, gap: pd.DataFrame) -> None:
+def write_summary(contrasts: pd.DataFrame, tests: pd.DataFrame) -> None:
     lines = []
-    lines.append("4.3.2 H1 Self-style advantage summary")
+    lines.append("4.3.2 H1 individualized consistent style vs mismatch")
+    lines.append("=" * 72)
+    lines.append("")
+    lines.append("Scope: longitudinal following tasks only (L3 Following, L4 Following).")
+    lines.append("Labels: Following Label from style.txt.")
+    lines.append("")
+    lines.append("Operationalization:")
+    lines.append("  Aligned best = max(Self, own-label preset) per subject.")
+    lines.append("  Aligned mean = mean(Self, own-label preset).")
+    lines.append("  Mismatch mean = mean of the two non-own presets.")
+    lines.append("  Extreme mismatch = opposite preset (Aggressive<->Conservative); Neutral uses mean(Aggressive, Conservative).")
     lines.append("")
     lines.append("Recommended figures:")
-    lines.append("- 4.3.2_H1_expectation_by_condition_style.png")
-    lines.append("- 4.3.2_H1_self_vs_others_expectation_heatmap.png")
-    lines.append("- 4.3.2_H1_self_gap_vs_best_other_heatmap.png")
+    lines.append("- 4.3.2_H1_following_expectation_by_style.png")
+    lines.append("- 4.3.2_H1_aligned_vs_mismatch_expectation_heatmap.png")
+    lines.append("- 4.3.2_H1_aligned_vs_mismatch_trust_heatmap.png")
+    lines.append("- 4.3.2_H1_expectation_by_label_group.png")
     lines.append("")
 
-    exp_gap = gap[gap["metric"] == "Expectation"]
-    lines.append("Expectation consistency:")
-    for _, row in exp_gap.iterrows():
-        status = "highest" if row["self_minus_best_other"] > 0 else "not highest"
+    primary = tests[(tests["analysis_scope"] == "All subjects") & (tests["metric_key"] == "expectation")]
+    lines.append("【Primary H1 tests — Expectation】")
+    for _, row in primary.iterrows():
         lines.append(
-            f"- {row['condition']}: Self={row['self_mean']:.2f}, best non-Self="
-            f"{row['best_other_style']} ({row['best_other_mean']:.2f}), "
-            f"gap={row['self_minus_best_other']:+.2f}; Self is {status}."
+            f"- {row['condition']}, {row['comparison']}: diff={row['mean_diff']:+.3f}, "
+            f"t({int(row['n']) - 1})={row['t']:.2f}, p={row['p_t']:.3f}, dz={row['dz']:.2f}."
         )
 
     lines.append("")
-    lines.append("Paired Self-vs-other expectation tests:")
-    exp_tests = tests[tests["metric_key"] == "expectation"]
-    for _, row in exp_tests.iterrows():
+    lines.append("【By Following Label group — Expectation, Aligned best vs Mismatch】")
+    for label in ["Aggressive", "Conservative", "Neutral"]:
+        sub = tests[
+            (tests["following_label"] == label)
+            & (tests["metric_key"] == "expectation")
+            & (tests["comparison"] == "Aligned best (Self/own) - Mismatch mean")
+        ]
+        for _, row in sub.iterrows():
+            lines.append(
+                f"- {label}, {row['condition']}: diff={row['mean_diff']:+.3f}, "
+                f"n={int(row['n'])}, p={row['p_t']:.3f}."
+            )
+
+    lines.append("")
+    lines.append("【Subject-level aligned-best advantage rate — Expectation】")
+    exp = contrasts[contrasts["metric_key"] == "expectation"].copy()
+    for condition_key, condition_label in H1_CONDITIONS:
+        sub = exp[exp["condition_key"] == condition_key]
+        better = (sub["aligned_best"] > sub["mismatch_mean"]).mean()
         lines.append(
-            f"- {row['condition']}, {row['comparison']}: diff={row['mean_diff']:+.2f}, "
-            f"t({int(row['n']) - 1})={row['t']:.2f}, p={row['p_t']:.3f}."
+            f"- {condition_label}: {100 * better:.1f}% subjects with aligned_best > mismatch_mean "
+            f"(mean gap={float((sub['aligned_best'] - sub['mismatch_mean']).mean()):+.3f})."
         )
 
     lines.append("")
     lines.append(
-        "Interpretation: H1 is partially supported. Self has the highest expectation score in L3 Following and "
-        "L4 Following, but not in L4 Overtaking. The strongest paired effects are Self > Conservative in L3 Following "
-        "and Self > Aggressive in L4 Following."
+        "Interpretation note: Positive differences indicate the individualized-consistent side "
+        "(Self and/or own-label preset) outperforms mismatched presets on the comparison-transformed scale."
     )
     (OUTPUT_DIR / "4.3.2_H1_result_summary.txt").write_text("\n".join(lines), encoding="utf-8")
 
@@ -432,23 +626,46 @@ def main() -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     df = pd.read_excel(EXCEL_FILE)
     detail = load_detail(df)
+    labels = load_style_labels()
+
+    contrasts = build_subject_contrasts(detail, labels)
+    tests_all = contrast_tests(contrasts)
+    subgroup_tests = []
+    for label in sorted(contrasts["following_label"].dropna().unique()):
+        subgroup_tests.append(contrast_tests(contrasts, label_filter=label))
+    tests = pd.concat([tests_all, *subgroup_tests], ignore_index=True)
+
     desc = descriptives(detail)
-    tests = self_vs_others(detail)
-    gap = self_gap_vs_best_other(desc)
+    legacy_tests = self_vs_others(detail)
 
-    detail.to_csv(OUTPUT_DIR / "4.3.2_H1_detail.csv", index=False, encoding="utf-8-sig")
+    contrasts.to_csv(OUTPUT_DIR / "4.3.2_H1_subject_contrasts.csv", index=False, encoding="utf-8-sig")
+    tests.to_csv(OUTPUT_DIR / "4.3.2_H1_aligned_vs_mismatch_tests.csv", index=False, encoding="utf-8-sig")
     desc.to_csv(OUTPUT_DIR / "4.3.2_H1_descriptive_stats.csv", index=False, encoding="utf-8-sig")
-    tests.to_csv(OUTPUT_DIR / "4.3.2_H1_self_vs_others_paired_tests.csv", index=False, encoding="utf-8-sig")
-    gap.to_csv(OUTPUT_DIR / "4.3.2_H1_self_gap_vs_best_other.csv", index=False, encoding="utf-8-sig")
+    legacy_tests.to_csv(OUTPUT_DIR / "4.3.2_H1_self_vs_others_supplementary.csv", index=False, encoding="utf-8-sig")
+    detail.to_csv(OUTPUT_DIR / "4.3.2_H1_detail.csv", index=False, encoding="utf-8-sig")
 
-    plot_expectation_means(detail, OUTPUT_DIR / "4.3.2_H1_expectation_by_condition_style.png")
-    plot_self_vs_others_heatmap(tests, OUTPUT_DIR / "4.3.2_H1_self_vs_others_expectation_heatmap.png")
-    plot_self_gap_heatmap(gap, OUTPUT_DIR / "4.3.2_H1_self_gap_vs_best_other_heatmap.png")
-    write_summary(desc, tests, gap)
+    plot_following_expectation_by_style(detail, OUTPUT_DIR / "4.3.2_H1_following_expectation_by_style.png")
+    plot_aligned_vs_mismatch_heatmap(
+        tests,
+        OUTPUT_DIR / "4.3.2_H1_aligned_vs_mismatch_expectation_heatmap.png",
+        "expectation",
+        "H1 Expectation: Aligned vs Mismatch (Following Tasks)",
+    )
+    plot_aligned_vs_mismatch_heatmap(
+        tests,
+        OUTPUT_DIR / "4.3.2_H1_aligned_vs_mismatch_trust_heatmap.png",
+        "trust",
+        "H1 Trust: Aligned vs Mismatch (Following Tasks)",
+    )
+    plot_by_label_expectation(contrasts, OUTPUT_DIR / "4.3.2_H1_expectation_by_label_group.png")
+    write_summary(contrasts, tests)
 
     print(f"detail rows: {len(detail)}")
+    print(f"contrast rows: {len(contrasts)}")
     print(f"test rows: {len(tests)}")
     print(f"output: {OUTPUT_DIR}")
+    print()
+    print(tests_all[tests_all["metric_key"] == "expectation"].to_string(index=False))
     return 0
 
 

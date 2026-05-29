@@ -200,6 +200,7 @@ def plot_style_box_with_points(detail_df: pd.DataFrame, out_path: Path) -> bool:
         patch_artist=True,
         widths=0.52,
         showmeans=True,
+        showfliers=False,
         meanprops={
             "marker": "D",
             "markerfacecolor": "white",

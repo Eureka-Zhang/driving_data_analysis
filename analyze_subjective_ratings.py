@@ -283,6 +283,79 @@ def plot_metric(detail: pd.DataFrame, metric: Metric, out_path: Path) -> bool:
     return True
 
 
+def subjective_heatmap_table(stats_df: pd.DataFrame) -> pd.DataFrame:
+    metric_order = [metric.title_en for metric in METRICS]
+    condition_order = [label for _, label in SUPER_GROUPS]
+    style_order = [STYLE_LABELS[style] for style in STYLE_ORDER]
+
+    sub = stats_df[stats_df["metric_en"].isin(metric_order)].copy()
+    table = sub.pivot_table(
+        index=["condition", "style"],
+        columns="metric_en",
+        values="mean",
+        aggfunc="mean",
+    )
+    row_index = pd.MultiIndex.from_product(
+        [condition_order, style_order],
+        names=["condition", "style"],
+    )
+    return table.reindex(index=row_index, columns=metric_order)
+
+
+def plot_subjective_heatmap(table: pd.DataFrame, out_path: Path) -> bool:
+    """Mean-score heatmap, using the H2 heatmap style and column-wise normalization."""
+    if not HAS_MPL:
+        return False
+    setup_font()
+
+    values = table.astype(float)
+    normed = values.copy()
+    for col in normed.columns:
+        col_values = values[col].to_numpy(dtype=float)
+        center = np.nanmean(col_values)
+        max_abs = np.nanmax(np.abs(col_values - center))
+        if not np.isfinite(max_abs) or max_abs == 0:
+            max_abs = 1.0
+        normed[col] = (values[col] - center) / max_abs
+
+    row_labels = [f"{condition} | {style}" for condition, style in values.index]
+
+    fig, ax = plt.subplots(figsize=(11.5, 6.8))
+    fig.patch.set_facecolor("white")
+    im = ax.imshow(normed.to_numpy(), cmap="RdYlGn_r", vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(np.arange(len(values.columns)))
+    ax.set_xticklabels(values.columns, rotation=20, ha="right")
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_yticklabels(row_labels)
+    ax.set_title("Subjective Mean Scores by Condition and Style", fontsize=13, fontweight="bold", pad=12)
+
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            value = values.iloc[i, j]
+            text = "" if pd.isna(value) else f"{value:.2f}"
+            ax.text(j, i, text, ha="center", va="center", fontsize=8.8, color="#222222")
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.82)
+    cbar.set_label("Column-centered normalized mean", fontsize=9)
+    ax.text(
+        0.0,
+        -0.16,
+        "Cell labels show raw means. Colors are normalized within each metric column, following the H2 heatmap palette.",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="#333333",
+    )
+    for spine in ax.spines.values():
+        spine.set_color("#333333")
+        spine.set_linewidth(0.8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def main() -> int:
     if not EXCEL_FILE.exists():
         print(f"Excel file not found: {EXCEL_FILE}", file=sys.stderr)
@@ -317,7 +390,12 @@ def main() -> int:
     stats_df = pd.DataFrame(all_stats)
     stats_path = OUTPUT_DIR / "4.3.1_各条件下主观评分_描述统计.csv"
     stats_df.to_csv(stats_path, index=False, encoding="utf-8-sig")
+    heatmap_table = subjective_heatmap_table(stats_df)
+    heatmap_table.to_csv(OUTPUT_DIR / "4.3.1_主观评分均值热图矩阵.csv", encoding="utf-8-sig")
+    heatmap_path = OUTPUT_DIR / "4.3.1_主观评分均值热图.png"
+    heatmap_plotted = plot_subjective_heatmap(heatmap_table, heatmap_path)
     print(f"stats -> {stats_path}")
+    print(f"heatmap={'ok' if heatmap_plotted else 'skipped'} -> {heatmap_path}")
     return 0
 
 
